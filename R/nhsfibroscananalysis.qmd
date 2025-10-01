@@ -1,0 +1,1562 @@
+---
+title: "NHS FibroScan Analysis"
+author: "Chung Au-Yeung"
+editor: visual
+execute:
+  echo: false
+  message: false
+  warning: false
+  fig-width: 10
+  fig-height: 10
+format: 
+  html:
+    embed-resources: true
+    page-layout: full 
+---
+
+## Introduction
+
+NHS FibroScan trucks provide free, quick, and non-invasive liver health checks. This programme targets at-risk groups in the community, including people with high levels of alcohol consumption, a current diagnosis or history of past viral hepatitis, or non-alcoholic liver disease as these factors increase the risk of developing liver cancer. However, given the limited availability of this service in Birmingham, it is crucial to ensure that the deployment is targeted to areas with greatest potential benefit. This requires identifying wards where the risk is highest by using mortality and deprivation data.
+
+## Method
+
+This analysis used mortality data obtained from BSOL warehouse SUS death register. Data are filtered to cover the 2024/25 financial year. This analysis followed the same ICD 10 codes related to chronic liver disease, alcohol-specific conditions and under 75 alcoholic liver disease that are being measured on fingertips. As directly age-standardised rates were calculated at the ward level, concerns regarding statistical instability due to small numbers were identified. To address this, spatial smoothing techniques were applied to borrow strength from neighbouring areas, thereby producing more stable and reliable rate estimates.
+
+In order to answer the question of "how do mortality rates vary with deprivation", a bivariate choropleth map was constructed. This type of map allows two pieces of information to be shown at the same time. In this case, the map displays both the smoothed mortality rates from alcoholic liver disease and the 2019 Index of Multiple Deprivation (IMD) scores for each ward. The map is divided into four groups for each measure, based on whether the values fall into the lowest 25%, the middle ranges (25–50% and 50–75%), or the highest 25% of areas. When these two dimensions are combined, the result is a four-by-four grid (16 possible categories) that shows how different levels of deprivation align with different levels of mortality. Of particular interest are the wards that fall into the “4–4” category, meaning they are in the highest quarter for both deprivation and mortality. Those wards will be highlighted in the following map visuals where their names will be displayed.
+
+Furthermore, harm index was calculated to summarise the burden across multiple indicators. This index combined standardised values (z-scores) of ward-level mortality and deprivation measures, including chronic liver disease mortality, under-75 alcoholic liver disease mortality, alcohol-specific mortality, and the Index of Multiple Deprivation (IMD). Each indicator was first standardised using the z-score method to account for differences in scale and variability, ensuring comparability across measures. To avoid negative values, 100 was added to the combined scores, such that a value of approximately 100 represents the average level of harm, with higher values indicating greater relative burden and lower values indicating lesser relative burden.
+
+To reflect different perspectives on prioritisation, three alternative weighting schemes were applied:
+
+-   \*Equal weighting\*\*, in which all indicators contributed equally to the harm index.
+
+-   **Health-dominant weighting**, in which greater weight was assigned to mortality measures (particularly under-75 alcoholic liver disease mortality) to emphasise the direct health burden.
+
+-   **Equity-dominant weighting**, in which IMD was weighted more heavily to highlight the influence of socioeconomic disadvantage.
+
+```{r setup}
+library(biscale)
+library(cowplot)
+library(ggspatial)
+library("tidyverse")
+library("dplyr")
+library("sf")
+library("sp")
+library("spdep")
+library("INLAspacetime")
+library(INLA)
+library(fmesher)
+library(readr)
+library(data.table)
+library(readxl)
+library(ggiraph)
+library(RColorBrewer)
+```
+
+## Mortality rates
+
+::: panel-tabset
+## Alcohol-specific mortality
+
+```{r}
+#| warning: false
+#| message: false
+#| echo: false
+#| results: 'hide'
+
+
+alcohol_specific_mortality <- read_excel("C:/Users/TMPACGAG/OneDrive - Birmingham City Council/Documents/R projects/addiction team/Jad_liverbus/alcohol_specific_mortality.xlsx")
+
+
+specificmort = alcohol_specific_mortality %>% 
+  select(DEC_AGEC, REG_DATE, WARD_OF_RESIDENCE_CODE) %>%
+  mutate(
+    AdmissionDate = as.Date(REG_DATE, format = "%m-%d-%Y"),
+    AgeGroup = case_when(
+      DEC_AGEC == 0 ~ "UNDER 1",
+      DEC_AGEC >= 1 & DEC_AGEC <= 4 ~ "1-4",
+      DEC_AGEC >= 5 & DEC_AGEC <= 9 ~ "5-9",
+      DEC_AGEC >= 10 & DEC_AGEC <= 14 ~ "10-14",
+      DEC_AGEC >= 15 & DEC_AGEC <= 19 ~ "15-19",
+      DEC_AGEC >= 20 & DEC_AGEC <= 24 ~ "20-24",
+      DEC_AGEC >= 25 & DEC_AGEC <= 29 ~ "25-29",
+      DEC_AGEC >= 30 & DEC_AGEC <= 34 ~ "30-34",
+      DEC_AGEC >= 35 & DEC_AGEC <= 39 ~ "35-39",
+      DEC_AGEC >= 40 & DEC_AGEC <= 44 ~ "40-44",
+      DEC_AGEC >= 45 & DEC_AGEC <= 49 ~ "45-49",
+      DEC_AGEC >= 50 & DEC_AGEC <= 54 ~ "50-54",
+      DEC_AGEC >= 55 & DEC_AGEC <= 59 ~ "55-59",
+      DEC_AGEC >= 60 & DEC_AGEC <= 64 ~ "60-64",
+      DEC_AGEC >= 65 & DEC_AGEC <= 69 ~ "65-69",
+      DEC_AGEC >= 70 & DEC_AGEC <= 74 ~ "70-74",
+      DEC_AGEC >= 75 & DEC_AGEC <= 79 ~ "75-79",
+      DEC_AGEC >= 80 & DEC_AGEC <= 84 ~ "80-84",
+      DEC_AGEC >= 85 & DEC_AGEC <= 89 ~ "85-89",
+      DEC_AGEC >= 90 ~ "90+",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(AdmissionDate >= "2024-04-01" & AdmissionDate <="2025-3-31" ) %>% 
+  group_by(WARD_OF_RESIDENCE_CODE, AgeGroup) %>%
+  summarise(count = n(), .groups = 'drop') 
+
+
+
+
+#just use the latest estimate 
+pop_estimate <- read_excel("~/R projects/addiction team/BDAP/pop_estimate_by_ward_2023_2018.xlsx")
+
+pop_estimate = pop_estimate %>% 
+  filter(Year == "2023") %>% 
+  select(-Year)
+
+
+
+#merge population estimate to mortaluty data 
+
+
+mergedward = merge(
+  pop_estimate,
+  specificmort ,
+  all.x = TRUE,
+  by.x = c("Ward", "AgeGroup"),
+  by.y = c("WARD_OF_RESIDENCE_CODE", "AgeGroup")
+)
+
+
+
+############################################################################
+
+#1) Build adjacency graph with poly2nb
+
+ward_map <- st_read("C:/Users/TMPACGAG/OneDrive - Birmingham City Council/Documents/R projects/addiction team/Jad_liverbus/Birmingham Ward map.json",quiet = TRUE)
+ward_map <- st_set_crs(ward_map, 4326)
+
+#Create new IDs in order of data
+ward_map$new_id = 1:nrow(ward_map)
+
+
+#Create the graph file to indicate who are and are not neighbors
+#Reproject to British National Grid (EPSG:27700)
+ward_map <- st_transform(ward_map, 27700)  # meters, avoids angular distortion
+ward_map <- st_make_valid(ward_map)
+which(!st_is_valid(ward_map))
+
+# Export to INLA graph
+mcnty_nb = poly2nb(ward_map, row.names = ward_map$new_id, queen = F)
+
+nb2INLA("ward.adj", mcnty_nb )
+g = inla.read.graph("ward.adj")
+
+
+# Make Ward_index consistent with ward_map ordering so node i refers to row i of ward_map
+ward_levels = ward_map %>%
+  st_drop_geometry() %>%
+  pull(new_id)  
+
+lookup <- ward_map %>%
+  st_drop_geometry() %>%
+  transmute(Ward = as.character(WD21CD),
+            new_id = as.character(new_id))
+
+mergedward <- mergedward %>%
+  mutate(Ward = as.character(Ward)) %>%
+  left_join(lookup, by = "Ward")
+
+
+# Build the INLA indices (now new_id exists)
+age_levels = c(
+  "UNDER 1","1-4","5-9","10-14","15-19","20-24","25-29","30-34",
+  "35-39","40-44","45-49","50-54","55-59","60-64","65-69",
+  "70-74","75-79","80-84","85-89","90+"
+)
+
+
+
+
+
+inla_dat  = mergedward %>%
+  mutate(
+    AgeGroup = as.numeric(factor(AgeGroup, levels = age_levels)),
+    new_id   = as.numeric(factor(new_id, levels = ward_levels)),  # align to map order
+    Ward_index = as.integer(new_id),                  # 1..N matching graph nodes
+    Age_index  = as.integer(AgeGroup),
+    count      = ifelse(is.na(count), 0L, as.integer(count)),
+    local_pop  = ifelse(is.na(local_pop), 0L, as.integer(local_pop))
+  )
+
+
+
+# Add fixed age factor (baseline per age group)
+# inla_dat = inla_dat %>% mutate(age_fac = factor(Age_index))
+
+# make sure local pop is numeric
+inla_dat = inla_dat %>% mutate(local_pop = as.numeric(local_pop))
+
+#filter out some of the younger age group because deaths in children are extremely rare
+inla_dat = inla_dat %>% 
+  filter(!Age_index %in% c("1","2","3","4","5","6"))
+
+#########################################################################
+#paper that i follow
+# https://ij-healthgeographics.biomedcentral.com/articles/10.1186/s12942-020-00251-z
+
+#define the fucntion
+formula<- count ~ 1 +     #intercept
+  f(Age_index, model = "ar1", constr = TRUE,  #assumption of first order autoregressive age dependence structure
+    hyper = list(
+      theta1 = list(prior = "pc.prec", param = c(1, 0.01)),  # standard deviation is probably small (keeps the effect smooth),
+      theta2  = list(prior = "pc.cor1", param = c(0, 0.9))    # The correlation is likely to be strong
+    ))+      # vague uniform(-1,1) as prior distribution
+  f(Ward_index,                                 
+    model = "bym2", graph = g, scale.model = TRUE,
+    hyper = list(
+      prec = list(prior = "pc.prec", param = c(1, 0.01)),
+      phi  = list(prior = "pc",      param = c(0.5, 2/3))
+    ),
+    group = Age_index,
+    control.group = list(model = "ar1")
+  )
+
+
+#run the function using poisson
+fit = suppressWarnings(
+  invisible(inla(
+  formula, 
+  family = "poisson",
+  offset = log(local_pop),
+  data = inla_dat,
+  control.predictor = list(compute = TRUE),
+  control.compute   = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+  verbose = FALSE
+)))
+
+
+
+
+
+
+
+
+
+
+```
+
+```{r}
+
+#bind them to the smoothed rate estimates you just calculated
+inla_result = inla_dat %>%
+  cbind(fit$summary.fitted.values[, c("mean","0.025quant","0.975quant")]) %>%
+  rename(smoothedcount= mean, lower025 = `0.025quant`, upper975 = `0.975quant`) %>% 
+  mutate(age_standardised_count = (smoothedcount/local_pop)* Standard_Population ) %>% 
+  group_by(Ward ) %>% 
+  summarise(
+    local_event = sum(count),
+    local_pop = sum(local_pop),
+    Standard_Population = 100000,
+    age_standardised_count = sum(age_standardised_count),
+    .groups = 'drop'
+  )
+
+
+
+########################################################
+
+ward_map_inla <- st_read("C:/Users/TMPACGAG/OneDrive - Birmingham City Council/Documents/R projects/addiction team/Jad_liverbus/Birmingham Ward map.json",quiet = TRUE)
+
+ward_map_inla <- st_set_crs(ward_map_inla , 4326)
+
+#########################################################
+#join inla result
+ward_map_inla = ward_map_inla %>% 
+  left_join(inla_result, by = c("WD21CD" = "Ward"))
+
+
+#load imd data and process
+imd_ward<- read_csv("C:/Users/TMPACGAG/OneDrive - Birmingham City Council/Documents/R projects/addiction team/Jad_liverbus/imd-income-deprivation-score-percentage-birmingham-wards.csv")
+
+
+imd_ward = imd_ward %>% 
+  filter(`Period Label` == "2019") %>% 
+  rename(IMD = Value)
+
+colnames(imd_ward) = gsub(" ", "_", colnames(imd_ward))
+
+#join imd data 
+warddatainla = ward_map_inla  %>% 
+  left_join(imd_ward, by = c("WD21CD" = "Area_Code")) 
+
+
+
+#apply bivaraiate function
+smootheddata2 = bi_class(warddatainla , x = age_standardised_count, y = IMD, style = "quantile", dim = 4)
+
+
+#################################################################
+#plot the map 
+#remove "'" and make tootip
+smootheddata2 = smootheddata2 %>% 
+  mutate(Area_Name = gsub("'", "", Area_Name),
+         tooltip = paste0("Ward: ", Area_Name,"\n",
+                          "Rate: ", round(age_standardised_count,2)," per 100,000", "\n",
+                          "IMD: ", IMD, "%", "\n",
+                          "Category: ", bi_class))
+
+#custom css
+tooltip_css = "
+  border-radius: 12px;
+  color: #333;
+  background-color: white;
+  padding: 10px;
+  font-size: 14px;
+  transition: all 0.5s ease-out;
+"
+
+smoothedplot2 = ggplot()+geom_sf_interactive(data = smootheddata2, mapping = aes(fill = bi_class, tooltip=tooltip, data_id = Area_Name), color = "white", size = 0.1, show.legend = FALSE) +
+  geom_sf_label_interactive(data = smootheddata2 %>% 
+                  filter(bi_class == "4-4"), aes(label = WD21NM), size = 2.8) + 
+  bi_scale_fill(pal = "GrPink2", dim = 4) +
+  labs(
+    title = "Smoothed alcohol-specific mortality in 24/25 \nand IMD score",
+    caption = "Contains OS data ©️ Crown copyright and database right 2025, Source: \nOffice for National Statistics licensed under the Open Government Licence v.3.0"
+  ) +
+  bi_theme(base_size = 14)+
+  theme( plot.caption.position = "plot",
+         plot.caption = element_text(hjust = 0, size = 10),
+         plot.margin = margin(t = 20, r = 20, b = 20, l = 20),
+         axis.title.x = element_blank(),
+         axis.title.y = element_blank(),
+         axis.text.x  = element_blank(),
+         axis.text.y  = element_blank(),
+         axis.ticks   = element_blank())+
+  ggspatial::annotation_north_arrow(
+    location = "br", which_north = "true",
+    height = grid::unit(3.2, "cm"),     
+    width  = grid::unit(3.2, "cm"),     
+    pad_x = unit(0.4, "in"), pad_y = unit(0.4, "in"),
+    style = ggspatial::north_arrow_nautical(
+      fill = c("black", "white"),
+      line_col = "grey20",
+      text_family = "ArcherPro Book"
+    )
+  )
+
+#create label
+labels2  = bi_class_breaks(smootheddata2, x = age_standardised_count, y = IMD, style = "quantile", 
+                dim = 4, dig_lab = 4, split = FALSE)
+
+#label squeezed together so i add\n
+labels2$bi_x = sub("-", "\n–", labels2$bi_x) 
+#Creating Legends
+
+legend2 <- bi_legend(pal = "GrPink2",
+                    dim = 4,
+                    xlab = "Higher mortality rate \nper 100,000",
+                    ylab = "Higher deprivation %",
+                    breaks = labels2,
+                    size = 11)
+
+
+ggsave("legend2.svg", plot = legend2, width = 3.5, height = 3.5, dpi = 300, bg = "white")
+
+# girafe(ggobj = smoothedplot3)
+# # combine map with legend
+#  # ggdraw() +
+#  #  draw_plot(girafe(ggobj = smoothedplot3), 0, 0, 1, 1) +
+#  #  draw_plot(legend3, -0.01, .6, 0.35, 0.35)
+
+
+
+interactive_map = girafe(
+  ggobj = smoothedplot2,
+  options = list(
+    opts_zoom(min = 1, max = 6),
+    opts_toolbar(position = "topright"),
+    opts_hover(css = ""),
+    opts_hover_inv(css = "opacity:0.5;"),
+    opts_tooltip(css = tooltip_css)
+  )
+)
+
+
+
+
+
+htmltools::browsable(
+  htmltools::div(
+    style = "position:relative; width:100%;",
+    interactive_map,
+    htmltools::img(
+      src = "legend2.svg",
+      style = paste(
+        "position:absolute; top:25%; left:12px;",
+        "transform:translateY(-50%) scale(", 0.9, ");",
+        "transform-origin: top left;",          # keep it anchored while scaling
+        "background:white; padding:8px;",
+        "border:1px solid #ccc; border-radius:8px; box-shadow:0 2px 6px rgba(0,0,0,.1);",
+        sep = " "
+      )
+    )
+  )
+)
+
+
+
+```
+
+## Mortality rate of chronic liver disease
+
+```{r}
+#| warning: false
+#| message: false
+#| echo: false
+#| results: 'hide'
+
+chronic_liver_disease <- read_excel("C:/Users/TMPACGAG/OneDrive - Birmingham City Council/Documents/R projects/addiction team/Jad_liverbus/chronic liver disease.xlsx")
+
+liverforward  = chronic_liver_disease %>% 
+  select(DEC_AGEC, REG_DATE, WARD_OF_RESIDENCE_CODE) %>%
+  mutate(
+    AdmissionDate = as.Date(REG_DATE, format = "%m-%d-%Y"),
+    AgeGroup = case_when(
+      DEC_AGEC == 0 ~ "UNDER 1",
+      DEC_AGEC >= 1 & DEC_AGEC <= 4 ~ "1-4",
+      DEC_AGEC >= 5 & DEC_AGEC <= 9 ~ "5-9",
+      DEC_AGEC >= 10 & DEC_AGEC <= 14 ~ "10-14",
+      DEC_AGEC >= 15 & DEC_AGEC <= 19 ~ "15-19",
+      DEC_AGEC >= 20 & DEC_AGEC <= 24 ~ "20-24",
+      DEC_AGEC >= 25 & DEC_AGEC <= 29 ~ "25-29",
+      DEC_AGEC >= 30 & DEC_AGEC <= 34 ~ "30-34",
+      DEC_AGEC >= 35 & DEC_AGEC <= 39 ~ "35-39",
+      DEC_AGEC >= 40 & DEC_AGEC <= 44 ~ "40-44",
+      DEC_AGEC >= 45 & DEC_AGEC <= 49 ~ "45-49",
+      DEC_AGEC >= 50 & DEC_AGEC <= 54 ~ "50-54",
+      DEC_AGEC >= 55 & DEC_AGEC <= 59 ~ "55-59",
+      DEC_AGEC >= 60 & DEC_AGEC <= 64 ~ "60-64",
+      DEC_AGEC >= 65 & DEC_AGEC <= 69 ~ "65-69",
+      DEC_AGEC >= 70 & DEC_AGEC <= 74 ~ "70-74",
+      DEC_AGEC >= 75 & DEC_AGEC <= 79 ~ "75-79",
+      DEC_AGEC >= 80 & DEC_AGEC <= 84 ~ "80-84",
+      DEC_AGEC >= 85 & DEC_AGEC <= 89 ~ "85-89",
+      DEC_AGEC >= 90 ~ "90+",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(AdmissionDate >= "2024-04-01" & AdmissionDate <="2025-3-31" ) %>% 
+  group_by(WARD_OF_RESIDENCE_CODE, AgeGroup) %>%
+  summarise(count = n(), .groups = 'drop') 
+
+
+
+
+#just use the latest estimate 
+pop_estimate <- read_excel("~/R projects/addiction team/BDAP/pop_estimate_by_ward_2023_2018.xlsx")
+
+pop_estimate = pop_estimate %>% 
+  filter(Year == "2023") %>% 
+  select(-Year)
+
+
+
+
+mergedward = merge(
+  pop_estimate,
+  liverforward ,
+  all.x = TRUE,
+  by.x = c("Ward", "AgeGroup"),
+  by.y = c("WARD_OF_RESIDENCE_CODE", "AgeGroup")
+)
+
+
+#Tidy AgeGroup factor and basic hygiene
+age_levels = c(
+  "UNDER 1","1-4","5-9","10-14","15-19","20-24","25-29","30-34",
+  "35-39","40-44","45-49","50-54","55-59","60-64","65-69",
+  "70-74","75-79","80-84","85-89","90+"
+)
+
+
+
+mergedward = mergedward %>%
+  mutate(
+    AgeGroup = factor(AgeGroup, levels = age_levels),
+    count = coalesce(as.integer(count), 0L),
+    local_pop = coalesce(as.integer(local_pop), 0L)
+  )
+
+
+
+#1) Build adjacency graph with poly2nb
+
+ward_map <- st_read("C:/Users/TMPACGAG/OneDrive - Birmingham City Council/Documents/R projects/addiction team/Jad_liverbus/Birmingham Ward map.json",quiet = TRUE)
+ward_map <- st_set_crs(ward_map, 4326)
+
+#Create new IDs in order of data
+ward_map$new_id = 1:nrow(ward_map)
+
+
+#Create the graph file to indicate who are and are not neighbors
+#Reproject to British National Grid (EPSG:27700)
+ward_map <- st_transform(ward_map, 27700)  # meters, avoids angular distortion
+ward_map <- st_make_valid(ward_map)
+which(!st_is_valid(ward_map))
+
+# Export to INLA graph
+mcnty_nb = poly2nb(ward_map, row.names = ward_map$new_id, queen = F)
+
+nb2INLA("ward.adj", mcnty_nb )
+g = inla.read.graph("ward.adj")
+
+
+# Make Ward_index consistent with ward_map ordering so node i refers to row i of ward_map
+ward_levels = ward_map %>%
+  st_drop_geometry() %>%
+  pull(new_id)  
+
+lookup <- ward_map %>%
+  st_drop_geometry() %>%
+  transmute(Ward = as.character(WD21CD),
+            new_id = as.character(new_id))
+
+mergedward <- mergedward %>%
+  mutate(Ward = as.character(Ward)) %>%
+  left_join(lookup, by = "Ward")
+
+
+# Build the INLA indices (now new_id exists)
+age_levels = c(
+  "UNDER 1","1-4","5-9","10-14","15-19","20-24","25-29","30-34",
+  "35-39","40-44","45-49","50-54","55-59","60-64","65-69",
+  "70-74","75-79","80-84","85-89","90+"
+)
+
+
+
+
+
+inla_dat  = mergedward %>%
+  mutate(
+    AgeGroup = as.numeric(factor(AgeGroup, levels = age_levels)),
+    new_id   = as.numeric(factor(new_id, levels = ward_levels)),  # align to map order
+    Ward_index = as.integer(new_id),                  # 1..N matching graph nodes
+    Age_index  = as.integer(AgeGroup),
+    count      = ifelse(is.na(count), 0L, as.integer(count)),
+    local_pop  = ifelse(is.na(local_pop), 0L, as.integer(local_pop))
+  )
+
+
+
+# Add fixed age factor (baseline per age group)
+# inla_dat = inla_dat %>% mutate(age_fac = factor(Age_index))
+
+# make sure local pop is numeric
+inla_dat = inla_dat %>% mutate(local_pop = as.numeric(local_pop))
+
+#filter out some of the younger age group because deaths in children are extremely rare
+# inla_dat = inla_dat %>% 
+#   filter(!Age_index %in% c("1","2","3","4","5","6"))
+
+#########################################################################
+#paper that i follow
+# https://ij-healthgeographics.biomedcentral.com/articles/10.1186/s12942-020-00251-z
+
+#define the fucntion
+formula<- count ~ 1 +     #intercept
+  f(Age_index, model = "ar1", constr = TRUE,  #assumption of first order autoregressive age dependence structure
+    hyper = list(
+      theta1 = list(prior = "pc.prec", param = c(1, 0.01)),  # standard deviation is probably small (keeps the effect smooth),
+      theta2  = list(prior = "pc.cor1", param = c(0, 0.9))    # The correlation is likely to be strong
+    ))+      # vague uniform(-1,1) as prior distribution
+  f(Ward_index,                                 
+    model = "bym2", graph = g, scale.model = TRUE,
+    hyper = list(
+      prec = list(prior = "pc.prec", param = c(1, 0.01)),
+      phi  = list(prior = "pc",      param = c(0.5, 2/3))
+    ),
+    group = Age_index,
+    control.group = list(model = "ar1")
+  )
+
+
+#run the function using poisson
+fit = suppressWarnings(
+  invisible(inla(
+  formula, 
+  family = "poisson",
+  offset = log(local_pop),
+  data = inla_dat,
+  control.predictor = list(compute = TRUE),
+  control.compute   = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+  verbose = FALSE
+)))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```
+
+```{r}
+
+
+#bind them to the smoothed rate estimates you just calculated
+inla_result = inla_dat %>%
+  cbind(fit$summary.fitted.values[, c("mean","0.025quant","0.975quant")]) %>%
+  rename(smoothedcount= mean, lower025 = `0.025quant`, upper975 = `0.975quant`) %>% 
+  mutate(age_standardised_count = (smoothedcount/local_pop)* Standard_Population ) %>% 
+  group_by(Ward ) %>% 
+  summarise(
+    local_event = sum(count),
+    local_pop = sum(local_pop),
+    Standard_Population = 100000,
+    age_standardised_count = sum(age_standardised_count),
+    .groups = 'drop'
+  )
+
+
+
+########################################################
+
+ward_map_inla <- st_read("C:/Users/TMPACGAG/OneDrive - Birmingham City Council/Documents/R projects/addiction team/Jad_liverbus/Birmingham Ward map.json",quiet = TRUE)
+
+ward_map_inla <- st_set_crs(ward_map_inla , 4326)
+
+#########################################################
+#join inla result
+ward_map_inla = ward_map_inla %>% 
+  left_join(inla_result, by = c("WD21CD" = "Ward"))
+
+
+#load imd data and process
+imd_ward<- read_csv("C:/Users/TMPACGAG/OneDrive - Birmingham City Council/Documents/R projects/addiction team/Jad_liverbus/imd-income-deprivation-score-percentage-birmingham-wards.csv")
+
+
+imd_ward = imd_ward %>% 
+  filter(`Period Label` == "2019") %>% 
+  rename(IMD = Value)
+
+colnames(imd_ward) = gsub(" ", "_", colnames(imd_ward))
+
+#join imd data 
+warddatainla = ward_map_inla  %>% 
+  left_join(imd_ward, by = c("WD21CD" = "Area_Code")) 
+
+
+
+#apply bivaraiate function
+smootheddata = bi_class(warddatainla , x = age_standardised_count, y = IMD, style = "quantile", dim = 4)
+
+
+#################################################################
+#plot the map 
+#remove "'" and make tootip
+smootheddata = smootheddata %>% 
+  mutate(Area_Name = gsub("'", "", Area_Name),
+         tooltip = paste0("Ward: ", Area_Name,"\n",
+                          "Rate: ", round(age_standardised_count,2)," per 100,000", "\n",
+                          "IMD: ", IMD, "%", "\n",
+                          "Category: ", bi_class))
+
+#custom css
+tooltip_css = "
+  border-radius: 12px;
+  color: #333;
+  background-color: white;
+  padding: 10px;
+  font-size: 14px;
+  transition: all 0.5s ease-out;
+"
+
+smoothedplot = ggplot()+geom_sf_interactive(data = smootheddata, mapping = aes(fill = bi_class, tooltip=tooltip, data_id = Area_Name), color = "white", size = 0.1, show.legend = FALSE) +
+  geom_sf_label_interactive(data = smootheddata %>% 
+                  filter(bi_class == "4-4"), aes(label = WD21NM), size = 2.8) + 
+  bi_scale_fill(pal = "GrPink2", dim = 4) +
+  labs(
+    title = "Smoothed mortality rate of chronic liver disease in 24/25 \nand IMD score",
+    caption = "Contains OS data ©️ Crown copyright and database right 2025, Source: \nOffice for National Statistics licensed under the Open Government Licence v.3.0"
+  ) +
+  bi_theme(base_size = 14)+
+  theme( plot.caption.position = "plot",
+         plot.caption = element_text(hjust = 0, size = 10),
+         plot.margin = margin(t = 20, r = 20, b = 20, l = 20),
+         axis.title.x = element_blank(),
+         axis.title.y = element_blank(),
+         axis.text.x  = element_blank(),
+         axis.text.y  = element_blank(),
+         axis.ticks   = element_blank())+
+  ggspatial::annotation_north_arrow(
+    location = "br", which_north = "true",
+    height = grid::unit(3.2, "cm"),     
+    width  = grid::unit(3.2, "cm"),     
+    pad_x = unit(0.4, "in"), pad_y = unit(0.4, "in"),
+    style = ggspatial::north_arrow_nautical(
+      fill = c("black", "white"),
+      line_col = "grey20",
+      text_family = "ArcherPro Book"
+    )
+  )
+
+#create label
+labels1  = bi_class_breaks(warddatainla, x = age_standardised_count, y = IMD, style = "quantile", 
+                dim = 4, dig_lab = 4, split = FALSE)
+
+#label squeezed together so i add\n
+labels1$bi_x = sub("-", "\n–", labels1$bi_x) 
+#Creating Legends
+
+legend <- bi_legend(pal = "GrPink2",
+                    dim = 4,
+                    xlab = "Higher mortality rate \nper 100,000",
+                    ylab = "Higher deprivation %",
+                    breaks = labels1,
+                    size = 11)
+
+
+ggsave("legend.svg", plot = legend, width = 3.5, height = 3.5, dpi = 300, bg = "white")
+
+# girafe(ggobj = smoothedplot3)
+# # combine map with legend
+#  # ggdraw() +
+#  #  draw_plot(girafe(ggobj = smoothedplot3), 0, 0, 1, 1) +
+#  #  draw_plot(legend3, -0.01, .6, 0.35, 0.35)
+
+
+
+interactive_map = girafe(
+  ggobj = smoothedplot,
+  options = list(
+    opts_zoom(min = 1, max = 6),
+    opts_toolbar(position = "topright"),
+    opts_hover(css = ""),
+    opts_hover_inv(css = "opacity:0.5;"),
+    opts_tooltip(css = tooltip_css)
+  )
+)
+
+
+
+
+
+htmltools::browsable(
+  htmltools::div(
+    style = "position:relative; width:100%;",
+    interactive_map,
+    htmltools::img(
+      src = "legend.svg",
+      style = paste(
+        "position:absolute; top:25%; left:12px;",
+        "transform:translateY(-50%) scale(", 0.9, ");",
+        "transform-origin: top left;",          # keep it anchored while scaling
+        "background:white; padding:8px;",
+        "border:1px solid #ccc; border-radius:8px; box-shadow:0 2px 6px rgba(0,0,0,.1);",
+        sep = " "
+      )
+    )
+  )
+)
+
+
+
+```
+
+## Under 75 mortality rate of alcoholic liver disease
+
+```{r}
+#| warning: false
+#| message: false
+#| echo: false
+#| results: 'hide'
+under_75_alcohlic <- read_excel("C:/Users/TMPACGAG/OneDrive - Birmingham City Council/Documents/R projects/addiction team/Jad_liverbus/under_75_alcohlic.xlsx")
+
+
+
+under75mort = under_75_alcohlic  %>% 
+  select(DEC_AGEC, REG_DATE, WARD_OF_RESIDENCE_CODE) %>%
+  mutate(
+    AdmissionDate = as.Date(REG_DATE, format = "%m-%d-%Y"),
+    AgeGroup = case_when(
+      DEC_AGEC == 0 ~ "UNDER 1",
+      DEC_AGEC >= 1 & DEC_AGEC <= 4 ~ "1-4",
+      DEC_AGEC >= 5 & DEC_AGEC <= 9 ~ "5-9",
+      DEC_AGEC >= 10 & DEC_AGEC <= 14 ~ "10-14",
+      DEC_AGEC >= 15 & DEC_AGEC <= 19 ~ "15-19",
+      DEC_AGEC >= 20 & DEC_AGEC <= 24 ~ "20-24",
+      DEC_AGEC >= 25 & DEC_AGEC <= 29 ~ "25-29",
+      DEC_AGEC >= 30 & DEC_AGEC <= 34 ~ "30-34",
+      DEC_AGEC >= 35 & DEC_AGEC <= 39 ~ "35-39",
+      DEC_AGEC >= 40 & DEC_AGEC <= 44 ~ "40-44",
+      DEC_AGEC >= 45 & DEC_AGEC <= 49 ~ "45-49",
+      DEC_AGEC >= 50 & DEC_AGEC <= 54 ~ "50-54",
+      DEC_AGEC >= 55 & DEC_AGEC <= 59 ~ "55-59",
+      DEC_AGEC >= 60 & DEC_AGEC <= 64 ~ "60-64",
+      DEC_AGEC >= 65 & DEC_AGEC <= 69 ~ "65-69",
+      DEC_AGEC >= 70 & DEC_AGEC <= 74 ~ "70-74",
+      DEC_AGEC >= 75 & DEC_AGEC <= 79 ~ "75-79",
+      DEC_AGEC >= 80 & DEC_AGEC <= 84 ~ "80-84",
+      DEC_AGEC >= 85 & DEC_AGEC <= 89 ~ "85-89",
+      DEC_AGEC >= 90 ~ "90+",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(AdmissionDate >= "2024-04-01" & AdmissionDate <="2025-3-31" ) %>% 
+  group_by(WARD_OF_RESIDENCE_CODE, AgeGroup) %>%
+  summarise(count = n(), .groups = 'drop') 
+
+
+
+
+#just use the latest estimate 
+pop_estimate <- read_excel("~/R projects/addiction team/BDAP/pop_estimate_by_ward_2023_2018.xlsx")
+
+pop_estimate = pop_estimate %>% 
+  filter(Year == "2023") %>% 
+  select(-Year)
+
+
+
+
+
+#merge population estimate to mortaluty data 
+
+
+mergedward = merge(
+  pop_estimate,
+  under75mort ,
+  all.x = TRUE,
+  by.x = c("Ward", "AgeGroup"),
+  by.y = c("WARD_OF_RESIDENCE_CODE", "AgeGroup")
+)
+
+
+############################################################################
+
+#Tidy AgeGroup factor and basic hygiene
+age_levels = c(
+  "UNDER 1","1-4","5-9","10-14","15-19","20-24","25-29","30-34",
+  "35-39","40-44","45-49","50-54","55-59","60-64","65-69",
+  "70-74","75-79","80-84","85-89","90+"
+)
+
+
+
+mergedward = mergedward %>%
+  mutate(
+    AgeGroup = factor(AgeGroup, levels = age_levels),
+    count = coalesce(as.integer(count), 0L),
+    local_pop = coalesce(as.integer(local_pop), 0L)
+  )
+
+
+#1) Build adjacency graph with poly2nb
+
+ward_map <- st_read("C:/Users/TMPACGAG/OneDrive - Birmingham City Council/Documents/R projects/addiction team/Jad_liverbus/Birmingham Ward map.json", quiet = TRUE)
+ward_map <- st_set_crs(ward_map, 4326)
+
+#Create new IDs in order of data
+ward_map$new_id = 1:nrow(ward_map)
+
+
+#Create the graph file to indicate who are and are not neighbors
+#Reproject to British National Grid (EPSG:27700)
+ward_map = st_transform(ward_map, 27700)  # meters, avoids angular distortion
+ward_map = st_make_valid(ward_map)
+which(!st_is_valid(ward_map))
+
+# Export to INLA graph
+mcnty_nb = poly2nb(ward_map, row.names = ward_map$new_id, queen = F)
+
+nb2INLA("ward.adj", mcnty_nb )
+g = inla.read.graph("ward.adj")
+
+
+# Make Ward_index consistent with ward_map ordering so node i refers to row i of ward_map
+ward_levels = ward_map %>%
+  st_drop_geometry() %>%
+  pull(new_id)  
+
+lookup = ward_map %>%
+  st_drop_geometry() %>%
+  transmute(Ward = as.character(WD21CD),
+            new_id = as.character(new_id))
+
+mergedward = mergedward %>%
+  mutate(Ward = as.character(Ward)) %>%
+  left_join(lookup, by = "Ward")
+
+
+# Build the INLA indices (now new_id exists)
+age_levels = c(
+  "UNDER 1","1-4","5-9","10-14","15-19","20-24","25-29","30-34",
+  "35-39","40-44","45-49","50-54","55-59","60-64","65-69",
+  "70-74","75-79","80-84","85-89","90+"
+)
+
+
+
+
+
+inla_dat  = mergedward %>%
+  mutate(
+    AgeGroup = AgeGroup,
+    new_id   = as.numeric(factor(new_id, levels = ward_levels)),  # align to map order
+    Ward_index = as.integer(new_id),                  # 1..N matching graph nodes
+    Age_index  = as.integer(as.numeric(factor(AgeGroup, levels = age_levels))),
+    count      = ifelse(is.na(count), 0L, as.integer(count)),
+    local_pop  = ifelse(is.na(local_pop), 0L, as.integer(local_pop))
+  )
+
+
+
+# Add fixed age factor (baseline per age group)
+# inla_dat = inla_dat %>% mutate(age_fac = factor(Age_index))
+
+# make sure local pop is numeric
+inla_dat = inla_dat %>% mutate(local_pop = as.numeric(local_pop))
+
+#filter out some of the younger age group because deaths in children are extremely rare
+inla_dat = inla_dat %>% 
+  filter(!Age_index %in% c("1","2","3","4","5","6", "17", "18","19","20"))
+
+
+
+#########################################################################
+#paper that i follow
+# https://ij-healthgeographics.biomedcentral.com/articles/10.1186/s12942-020-00251-z
+
+#define the fucntion
+formula3= count ~ 1 +     #intercept
+  f(Age_index, model = "ar1", constr = TRUE,  #assumption of first order autoregressive age dependence structure
+    hyper = list(
+      theta1 = list(prior = "pc.prec", param = c(1, 0.01)),  # standard deviation is probably small (keeps the effect smooth),
+      theta2  = list(prior = "pc.cor1", param = c(0, 0.9))    # The correlation is likely to be strong
+    ))+      # vague uniform(-1,1) as prior distribution
+  f(Ward_index,                                 
+    model = "bym2", graph = g, scale.model = TRUE,
+    hyper = list(
+      prec = list(prior = "pc.prec", param = c(1, 0.01)),
+      phi  = list(prior = "pc",      param = c(0.5, 2/3))
+    ),
+    group = Age_index,
+    control.group = list(model = "ar1")
+  )
+
+
+#run the function using poisson
+fit3 = suppressWarnings(
+  invisible(
+    inla(
+      formula3, 
+      family = "poisson",
+      offset = log(local_pop),
+      data = inla_dat,
+      control.predictor = list(compute = TRUE),
+      control.compute   = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+      verbose = FALSE
+    )
+  )
+)
+
+
+
+
+#####################################
+
+
+
+
+```
+
+```{r}
+
+#bind them to the smoothed rate estimates you just calculated
+inla_result = inla_dat %>%
+  cbind(fit3$summary.fitted.values[, c("mean","0.025quant","0.975quant")]) %>%
+  rename(smoothedcount= mean, lower025 = `0.025quant`, upper975 = `0.975quant`) %>%  mutate(age_standardised_count = (smoothedcount/local_pop)* Standard_Population ) %>% 
+  group_by(Ward ) %>% 
+  summarise(
+    local_event = sum(count),
+    local_pop = sum(local_pop),
+    Standard_Population = 100000,
+    age_standardised_count = sum(age_standardised_count),
+    .groups = 'drop'
+  )
+
+
+
+########################################################
+
+ward_map_inla <- st_read("C:/Users/TMPACGAG/OneDrive - Birmingham City Council/Documents/R projects/addiction team/Jad_liverbus/Birmingham Ward map.json",quiet = TRUE)
+
+ward_map_inla <- st_set_crs(ward_map_inla , 4326)
+
+#########################################################
+#join inla result
+ward_map_inla = ward_map_inla %>% 
+  left_join(inla_result, by = c("WD21CD" = "Ward"))
+
+
+#load imd data and process
+imd_ward<- read_csv("C:/Users/TMPACGAG/OneDrive - Birmingham City Council/Documents/R projects/addiction team/Jad_liverbus/imd-income-deprivation-score-percentage-birmingham-wards.csv")
+
+
+imd_ward = imd_ward %>% 
+  filter(`Period Label` == "2019") %>% 
+  rename(IMD = Value)
+
+colnames(imd_ward) = gsub(" ", "_", colnames(imd_ward))
+
+#join imd data 
+warddatainla = ward_map_inla  %>% 
+  left_join(imd_ward, by = c("WD21CD" = "Area_Code")) 
+
+
+
+#apply bivaraiate function
+smootheddata3 = bi_class(warddatainla , x = age_standardised_count, y = IMD, style = "quantile", dim = 4)
+
+
+#################################################################
+#plot the map 
+#remove "'" and make tootip
+smootheddata3 = smootheddata3 %>% 
+  mutate(Area_Name = gsub("'", "", Area_Name),
+         tooltip = paste0("Ward: ", Area_Name,"\n",
+                          "Rate: ", round(age_standardised_count,2)," per 100,000", "\n",
+                          "IMD: ", IMD, "%", "\n",
+                          "Category: ", bi_class))
+
+#custom css
+tooltip_css = "
+  border-radius: 12px;
+  color: #333;
+  background-color: white;
+  padding: 10px;
+  font-size: 14px;
+  transition: all 0.5s ease-out;
+"
+
+
+
+smoothedplot3 = ggplot() +
+  geom_sf_interactive(data = smootheddata3, mapping = aes(fill = bi_class, tooltip=tooltip, data_id = Area_Name), color = "white", size = 0.1, show.legend = FALSE) +
+  geom_sf_label_interactive(data = smootheddata3 %>% 
+                  filter(bi_class == "4-4"), aes(label = WD21NM), size = 2.8) + 
+  bi_scale_fill(pal = "GrPink2", dim = 4) +
+  labs(
+    title = "Smoothed under 75 mortality rate of alcoholic liver disease in 24/25 \nand IMD score",
+    caption = "Contains OS data ©️ Crown copyright and database right 2025, Source: \nOffice for National Statistics licensed under the Open Government Licence v.3.0"
+  ) +
+  bi_theme(base_size = 14)+
+  theme( plot.caption.position = "plot",
+         plot.caption = element_text(hjust = 0, size = 10),
+         plot.margin = margin(t = 20, r = 20, b = 20, l = 20),
+         axis.title.x = element_blank(),
+         axis.title.y = element_blank(),
+         axis.text.x  = element_blank(),
+         axis.text.y  = element_blank(),
+         axis.ticks   = element_blank())+
+  ggspatial::annotation_north_arrow(
+    location = "br", which_north = "true",
+    height = grid::unit(3.2, "cm"),     
+    width  = grid::unit(3.2, "cm"),     
+    pad_x = unit(0.4, "in"), pad_y = unit(0.4, "in"),
+    style = ggspatial::north_arrow_nautical(
+      fill = c("black", "white"),
+      line_col = "grey20",
+      text_family = "ArcherPro Book"
+    )
+  )
+
+
+
+#create label
+labels3  = bi_class_breaks(warddatainla, x = age_standardised_count, y = IMD, style = "quantile", 
+                           dim = 4, dig_lab = 4, split = FALSE)
+
+#label squeezed together so i add\n
+labels3$bi_x = sub("-", "\n–", labels3$bi_x) 
+#Creating Legends
+
+legend3 <- bi_legend(pal = "GrPink2",
+                    dim = 4,
+                    xlab = "Higher mortality rate \nper 100,000",
+                    ylab = "Higher deprivation %",
+                    breaks = labels3,
+                    size = 11)
+
+ggsave("legend3.svg", plot = legend3, width = 3.5, height = 3.5, dpi = 300, bg = "white")
+
+# girafe(ggobj = smoothedplot3)
+# # combine map with legend
+#  # ggdraw() +
+#  #  draw_plot(girafe(ggobj = smoothedplot3), 0, 0, 1, 1) +
+#  #  draw_plot(legend3, -0.01, .6, 0.35, 0.35)
+
+
+
+
+
+
+
+
+
+interactive_map = girafe(
+  ggobj = smoothedplot3,
+  options = list(
+    opts_zoom(min = 1, max = 6),
+    opts_toolbar(position = "topright"),
+    opts_hover(css = ""),
+    opts_hover_inv(css = "opacity:0.5;"),
+    opts_tooltip(css = tooltip_css)
+  )
+)
+
+
+
+
+
+
+htmltools::browsable(
+  htmltools::div(
+    style = "position:relative; width:100%;",
+    interactive_map,
+    htmltools::img(
+      src = "legend3.svg",
+      style = paste(
+        "position:absolute; top:25%; left:12px;",
+        "transform:translateY(-50%) scale(", 0.9, ");",
+        "transform-origin: top left;",          # keep it anchored while scaling
+        "background:white; padding:8px;",
+        "border:1px solid #ccc; border-radius:8px; box-shadow:0 2px 6px rgba(0,0,0,.1);",
+        sep = " "
+      )
+    )
+  )
+)
+
+
+
+
+
+
+
+
+```
+
+```{r}
+#| warning: false
+#| message: false
+#| echo: false
+#| results: 'hide'
+smootheddata$indicator = "chronicliver"
+smootheddata2$indicator = "alcoholspecific"
+smootheddata3$indicator = "under75liver"
+
+IMD = smootheddata %>% 
+  mutate(age_standardised_count = IMD,
+         indicator = "IMD")
+
+harmscore_equal = rbindlist(list(smootheddata,smootheddata2,smootheddata2,IMD)) %>% 
+  select(WD21CD, Area_Name, age_standardised_count, indicator) %>% 
+  rename(value = age_standardised_count) %>% 
+  group_by(indicator)%>% 
+  mutate(
+    z_score = (value - mean(value, na.rm = TRUE)) / sd(value, na.rm = TRUE)
+  ) %>% 
+  ungroup() %>% 
+  group_by(WD21CD, Area_Name) %>% 
+  summarise(
+    z_score = sum(z_score)+100
+  )%>% 
+  ungroup() %>% 
+  mutate(
+    rank = dense_rank(desc(z_score))   # 1 = highest score
+  )
+
+
+harmscore_health = rbindlist(list(smootheddata,smootheddata2,smootheddata2,IMD)) %>% 
+  select(WD21CD, Area_Name, age_standardised_count, indicator) %>% 
+  rename(value = age_standardised_count) %>% 
+  group_by(indicator)%>% 
+  mutate(
+    z_score = (value - mean(value, na.rm = TRUE)) / sd(value, na.rm = TRUE)
+  ) %>% 
+  ungroup() %>% 
+  mutate(Weighting = case_when(indicator == "IMD" ~1,
+                               indicator == "under75liver"~3,
+                               indicator == "chronicliver"~2,
+                               indicator == "alcoholspecific"~2,
+                               TRUE ~ 0
+  )) %>% 
+  group_by(WD21CD, Area_Name) %>% 
+  summarise(
+    z_score = sum(z_score * Weighting, na.rm = TRUE) / sum(Weighting, na.rm = TRUE)+100
+  )%>% 
+  ungroup() %>% 
+  mutate(
+    rank = dense_rank(desc(z_score))   # 1 = highest score
+  )
+
+
+
+harmscore_equity = rbindlist(list(smootheddata,smootheddata2,smootheddata2,IMD)) %>% 
+  select(WD21CD, Area_Name, age_standardised_count, indicator) %>% 
+  rename(value = age_standardised_count) %>% 
+  group_by(indicator)%>% 
+  mutate(
+    z_score = (value - mean(value, na.rm = TRUE)) / sd(value, na.rm = TRUE)
+  ) %>% 
+  ungroup() %>% 
+  mutate(Weighting = case_when(indicator == "IMD" ~3,
+                               indicator == "under75liver"~2,
+                               indicator == "chronicliver"~2,
+                               indicator == "alcoholspecific"~1,
+                               TRUE ~ 0
+  )) %>% 
+  group_by(WD21CD, Area_Name) %>% 
+  summarise(
+    z_score = sum(z_score * Weighting, na.rm = TRUE) / sum(Weighting, na.rm = TRUE)+100
+  ) %>% 
+  ungroup() %>% 
+  mutate(
+    rank = dense_rank(desc(z_score))   # 1 = highest score
+  )
+```
+:::
+
+The map presents the distribution of mortality rates in Birmingham at ward level for the 2024/25 financial year, using age-standardised mortality rates alongside the 2019 Index of Multiple Deprivation (IMD) scores. A bivariate colour scheme has been applied to enable simultaneous interpretation of both indicators.
+
+-   **Grey areas** denote wards with lower mortality rates and lower deprivation.\
+-   **Red areas** indicate wards with higher mortality rates but lower deprivation.\
+-   **Blue areas** highlight wards with lower mortality rates but higher deprivation.\
+-   **Brown areas** represent wards with both higher mortality rates and higher deprivation.
+
+For alcohol specific mortality, Handsworth, Lozells, Newtown, Garretts Green, and King’s Norton South are classified within the 4–4 quadrant (brown), reflecting the co-occurrence of elevated alcohol-specific mortality and high deprivation. A similar pattern is observed for chronic liver disease mortality and under-75 alcoholic liver disease mortality, with Handsworth, Lozells, Newtown, and Garretts Green consistently occupying the 4–4 category.
+
+## Harm score index
+
+::: panel-tabset
+## Equal weighting
+
+```{r}
+#| echo: false
+
+ward_map_harmindex<- st_read("C:/Users/TMPACGAG/OneDrive - Birmingham City Council/Documents/R projects/addiction team/Jad_liverbus/Birmingham Ward map.json",quiet = TRUE)
+
+
+ward_map_harmindex <- st_set_crs(ward_map_harmindex , 4326)
+
+#########################################################
+#join inla result
+ward_map_harmindex = ward_map_harmindex %>% 
+  left_join(harmscore_equal, by = c("WD21CD"))
+
+#################################################################
+#plot the map 
+#remove "'" and make tootip
+ward_map_harmindex = ward_map_harmindex %>% 
+  mutate(Area_Name = gsub("'", "", Area_Name),
+         tooltip = paste0("Ward: ", Area_Name,"\n",
+                          "Index: ", round(z_score,2), "\n",
+                          "Rank: ", rank))
+
+
+
+#custom css
+tooltip_css = "
+  border-radius: 12px;
+  color: #333;
+  background-color: white;
+  padding: 10px;
+  font-size: 14px;
+  transition: all 0.5s ease-out;
+"
+
+
+
+harmequalplot = ggplot() +
+  geom_sf_interactive(data = ward_map_harmindex, mapping = aes(fill = z_score, tooltip=tooltip, data_id = Area_Name), color = "white", size = 0.1, show.legend = TRUE) +
+    scale_fill_distiller(
+    palette = "Blues",    
+    direction = 1,        
+    name = "Harm index"
+  ) +
+  geom_sf_label_interactive(data = ward_map_harmindex %>% 
+                  filter(z_score == max(z_score)), aes(label = WD21NM), size = 2.8, fill = "white") + 
+  labs(
+    title = "Harm index with equal weighting",
+    caption = "Contains OS data ©️ Crown copyright and database right 2025, Source: \nOffice for National Statistics licensed under the Open Government Licence v.3.0"
+  ) +
+  theme_void(base_size = 14)+
+  theme( plot.caption.position = "plot",
+         plot.caption = element_text(hjust = 0, size = 10),
+         plot.margin = margin(t = 20, r = 20, b = 20, l = 20),
+         axis.title.x = element_blank(),
+         axis.title.y = element_blank(),
+         axis.text.x  = element_blank(),
+         axis.text.y  = element_blank(),
+         axis.ticks   = element_blank(),
+         legend.position = "left")+
+  ggspatial::annotation_north_arrow(
+    location = "br", which_north = "true",
+    height = grid::unit(3.2, "cm"),     
+    width  = grid::unit(3.2, "cm"),     
+    pad_x = unit(0.4, "in"), pad_y = unit(0.4, "in"),
+    style = ggspatial::north_arrow_nautical(
+      fill = c("black", "white"),
+      line_col = "grey20",
+      text_family = "ArcherPro Book"
+    )
+  )
+
+
+
+interactive_map = girafe(
+  ggobj = harmequalplot,
+  options = list(
+    opts_zoom(min = 1, max = 6),
+    opts_toolbar(position = "topright"),
+    opts_hover(css = ""),
+    opts_hover_inv(css = "opacity:0.5;"),
+    opts_tooltip(css = tooltip_css)
+  )
+)
+
+
+htmltools::browsable(
+  htmltools::div(
+    style = "position:relative; width:100%;",
+    interactive_map
+      )
+    )
+  
+
+
+
+
+
+```
+
+## Health-dominant weighting
+
+```{r}
+#| echo: false
+
+ward_map_harmindex<- st_read("C:/Users/TMPACGAG/OneDrive - Birmingham City Council/Documents/R projects/addiction team/Jad_liverbus/Birmingham Ward map.json",quiet = TRUE)
+
+
+ward_map_harmindex <- st_set_crs(ward_map_harmindex , 4326)
+
+#########################################################
+#join inla result
+ward_map_harmindex = ward_map_harmindex %>% 
+  left_join(harmscore_health, by = c("WD21CD"))
+
+#################################################################
+#plot the map 
+#remove "'" and make tootip
+ward_map_harmindex = ward_map_harmindex %>% 
+  mutate(Area_Name = gsub("'", "", Area_Name),
+         tooltip = paste0("Ward: ", Area_Name,"\n",
+                          "Index: ", round(z_score,2), "\n",
+                          "Rank: ", rank))
+
+
+
+#custom css
+tooltip_css = "
+  border-radius: 12px;
+  color: #333;
+  background-color: white;
+  padding: 10px;
+  font-size: 14px;
+  transition: all 0.5s ease-out;
+"
+
+
+
+harmequalplot = ggplot() +
+  geom_sf_interactive(data = ward_map_harmindex, mapping = aes(fill = z_score, tooltip=tooltip, data_id = Area_Name), color = "white", size = 0.1, show.legend = TRUE) +
+    scale_fill_distiller(
+    palette = "Blues",    
+    direction = 1,        
+    name = "Harm index"
+  ) +
+  geom_sf_label_interactive(data = ward_map_harmindex %>% 
+                  filter(z_score == max(z_score)), aes(label = WD21NM), size = 2.8, fill = "white") + 
+  labs(
+    title = "Harm index with health-dominant weighting",
+    caption = "Contains OS data ©️ Crown copyright and database right 2025, Source: \nOffice for National Statistics licensed under the Open Government Licence v.3.0"
+  ) +
+  theme_void(base_size = 14)+
+  theme( plot.caption.position = "plot",
+         plot.caption = element_text(hjust = 0, size = 10),
+         plot.margin = margin(t = 20, r = 20, b = 20, l = 20),
+         axis.title.x = element_blank(),
+         axis.title.y = element_blank(),
+         axis.text.x  = element_blank(),
+         axis.text.y  = element_blank(),
+         axis.ticks   = element_blank(),
+         legend.position = "left")+
+  ggspatial::annotation_north_arrow(
+    location = "br", which_north = "true",
+    height = grid::unit(3.2, "cm"),     
+    width  = grid::unit(3.2, "cm"),     
+    pad_x = unit(0.4, "in"), pad_y = unit(0.4, "in"),
+    style = ggspatial::north_arrow_nautical(
+      fill = c("black", "white"),
+      line_col = "grey20",
+      text_family = "ArcherPro Book"
+    )
+  )
+
+
+
+interactive_map = girafe(
+  ggobj = harmequalplot,
+  options = list(
+    opts_zoom(min = 1, max = 6),
+    opts_toolbar(position = "topright"),
+    opts_hover(css = ""),
+    opts_hover_inv(css = "opacity:0.5;"),
+    opts_tooltip(css = tooltip_css)
+  )
+)
+
+
+htmltools::browsable(
+  htmltools::div(
+    style = "position:relative; width:100%;",
+    interactive_map
+      )
+    )
+  
+
+
+
+
+
+
+```
+
+## Equity-dominant weighting
+
+```{r}
+#| echo: false
+
+ward_map_harmindex<- st_read("C:/Users/TMPACGAG/OneDrive - Birmingham City Council/Documents/R projects/addiction team/Jad_liverbus/Birmingham Ward map.json",quiet = TRUE)
+
+
+ward_map_harmindex <- st_set_crs(ward_map_harmindex , 4326)
+
+#########################################################
+#join inla result
+ward_map_harmindex = ward_map_harmindex %>% 
+  left_join(harmscore_equity , by = c("WD21CD"))
+
+#################################################################
+#plot the map 
+#remove "'" and make tootip
+ward_map_harmindex = ward_map_harmindex %>% 
+  mutate(Area_Name = gsub("'", "", Area_Name),
+         tooltip = paste0("Ward: ", Area_Name,"\n",
+                          "Index: ", round(z_score,2), "\n",
+                          "Rank: ", rank))
+
+
+#custom css
+tooltip_css = "
+  border-radius: 12px;
+  color: #333;
+  background-color: white;
+  padding: 10px;
+  font-size: 14px;
+  transition: all 0.5s ease-out;
+"
+
+
+
+harmequalplot = ggplot() +
+  geom_sf_interactive(data = ward_map_harmindex, mapping = aes(fill = z_score, tooltip=tooltip, data_id = Area_Name), color = "white", size = 0.1, show.legend = TRUE) +
+    scale_fill_distiller(
+    palette = "Blues",    
+    direction = 1,        
+    name = "Harm index"
+  ) +
+  geom_sf_label_interactive(data = ward_map_harmindex %>% 
+                  filter(z_score == max(z_score)), aes(label = WD21NM), size = 2.8, fill = "white") + 
+  labs(
+    title = "Harm index with equity-dominant weighting",
+    caption = "Contains OS data ©️ Crown copyright and database right 2025, Source: \nOffice for National Statistics licensed under the Open Government Licence v.3.0"
+  ) +
+  theme_void(base_size = 14)+
+  theme( plot.caption.position = "plot",
+         plot.caption = element_text(hjust = 0, size = 10),
+         plot.margin = margin(t = 20, r = 20, b = 20, l = 20),
+         axis.title.x = element_blank(),
+         axis.title.y = element_blank(),
+         axis.text.x  = element_blank(),
+         axis.text.y  = element_blank(),
+         axis.ticks   = element_blank(),
+         legend.position = "left")+
+  ggspatial::annotation_north_arrow(
+    location = "br", which_north = "true",
+    height = grid::unit(3.2, "cm"),     
+    width  = grid::unit(3.2, "cm"),     
+    pad_x = unit(0.4, "in"), pad_y = unit(0.4, "in"),
+    style = ggspatial::north_arrow_nautical(
+      fill = c("black", "white"),
+      line_col = "grey20",
+      text_family = "ArcherPro Book"
+    )
+  )
+
+
+
+interactive_map = girafe(
+  ggobj = harmequalplot,
+  options = list(
+    opts_zoom(min = 1, max = 6),
+    opts_toolbar(position = "topright"),
+    opts_hover(css = ""),
+    opts_hover_inv(css = "opacity:0.5;"),
+    opts_tooltip(css = tooltip_css)
+  )
+)
+
+
+htmltools::browsable(
+  htmltools::div(
+    style = "position:relative; width:100%;",
+    interactive_map
+      )
+    )
+  
+
+
+
+
+
+
+
+
+
+
+
+```
+:::
+
+The harm index demonstrated that Newtown consistently ranked highest across all weighting scenarios, implying that if only a single ward were to be prioritised for the deployment of the FibroScan service, Newtown would represent the most appropriate choice. The consistency of this result across weighting approaches strengthens confidence in the robustness of Newtown’s prioritisation, highlighting it as the ward most likely to benefit from targeted liver health interventions.
+
+## Conclusion
+
+In conclusion, while Newtown emerged as the highest-priority ward across all versions of the harm index, surrounding areas such as Lozells and Handsworth are neighbours to Newtown and were consistently classified within the 4–4 category in the bivariate analysis. This suggests that although Newtown represents the single most pressing location, neighbouring wards demonstrate similarly elevated levels of need. Accordingly, deployment of the FibroScan service should not focus solely on Newtown but rather a strategy in which the mobile truck rotates across Newtown and these adjacent wards would be beneficial, ensuring that populations experiencing comparable levels of harm and deprivation are reached effectively.
