@@ -28,7 +28,7 @@ Furthermore, harm index was calculated to summarise the burden across multiple i
 
 To reflect different perspectives on prioritisation, three alternative weighting schemes were applied:
 
--   \*Equal weighting\*\*, in which all indicators contributed equally to the harm index.
+-   **Equal weighting**, in which all indicators contributed equally to the harm index.
 
 -   **Health-dominant weighting**, in which greater weight was assigned to mortality measures (particularly under-75 alcoholic liver disease mortality) to emphasise the direct health burden.
 
